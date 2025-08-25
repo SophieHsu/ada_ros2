@@ -216,11 +216,9 @@ def generate_launch_description():
     # Get URDF via xacro
     robot_description_content = Command(
         [
-            PathJoinSubstitution([FindExecutable(name="xacro")]),
+            FindExecutable(name="xacro"),
             " ",
-            PathJoinSubstitution(
-                str(moveit_config.package_path / "config/ada.urdf.xacro")
-            ),
+            str(moveit_config.package_path / "config/ada.urdf.xacro"),
             " ",
             "sim:=",
             sim,

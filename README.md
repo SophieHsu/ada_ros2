@@ -27,13 +27,16 @@ To use Servo with keyboard teleop:
    1. Sim: `ros2 run ada_feeding dummy_ft_sensor.py`
    2. Real: `ros2 run forque_sensor_hardware forque_sensor_hardware`
 2. Launch MoveIt:
-   1. Sim:`ros2 launch ada_moveit demo.launch.py sim:=mock`
+   1. Sim:`ros2 launch ada_moveit demo.launch.py sim:=mock use_servo:=true`
    2. Real: `ros2 launch ada_moveit demo.launch.py`
 3. Re-tare the F/T sensor: `ros2 service call /wireless_ft/set_bias std_srvs/srv/SetBool "{data: true}"`
 4. Enable MoveIt Servo:
    1. Switch Controllers: `ros2 service call /controller_manager/switch_controller controller_manager_msgs/srv/SwitchController "{activate_controllers: [\"jaco_arm_servo_controller\"], deactivate_controllers: [\"jaco_arm_controller\"], start_controllers: [], stop_controllers: [], strictness: 0, start_asap: false, activate_asap: false, timeout: {sec: 0, nanosec: 0}}"`
    2. Toggle Servo On: `ros2 service call /servo_node/start_servo std_srvs/srv/Trigger "{}"`
-5. Run the keyboard teleop script: `ros2 run ada_moveit ada_keyboard_teleop.py`
+5. Run the keyboard teleop script:
+   - For mock simulation: `ros2 run ada_moveit ada_keyboard_teleop.py --mock`
+   - For real robot: `ros2 run ada_moveit ada_keyboard_teleop.py --real`
+   - Default (mock): `ros2 run ada_moveit ada_keyboard_teleop.py`
 6. Follow the on-screen instructions to teleoperate the robot. Note that although cartesian control avoids obstacles in the planning scene, joint control does not.
 7. Toggle Servo Off: `ros2 service call /servo_node/stop_servo std_srvs/srv/Trigger "{}"`
 
@@ -43,6 +46,34 @@ To create your own Servo client:
 2. Have your client publish Twist commands to `/servo_node/delta_twist_cmds`. Note the following:
    1. For reliable cartesian control when sending angular velocities on the real robot and `lovelace`, ensure the angular velocity is \<= 0.3 rad/s in magnitude. Greater angular velocities might change the end effector's position in addition to its orientation. We believe this is because of latencies with MoveIt Servo getting the robot's joint states via the joint state publisher.
    2. Be sure to send 0-velocity Twist messages at the end to stop the robot.
+
+## Keyboard Control Modes
+
+The keyboard teleop script supports two different modes depending on your setup:
+
+### Mock Simulation Mode (`--mock`)
+- **Use case**: RViz simulation with MoveIt Servo
+- **Topic**: `/servo_node/delta_twist_cmds`
+- **Features**: 
+  - Real-time cartesian control via MoveIt Servo
+  - Collision detection and singularity avoidance
+  - Joint trajectory output for smooth motion
+- **Command**: `ros2 run ada_moveit ada_keyboard_teleop.py --mock`
+
+### Real Robot Mode (`--real`)
+- **Use case**: Physical robot with cartesian controller
+- **Topic**: `/jaco_arm_cartesian_controller/twist_cmd`
+- **Features**:
+  - Direct twist control to cartesian controller
+  - Hardware-level safety limits
+  - Real-time robot response
+- **Command**: `ros2 run ada_moveit ada_keyboard_teleop.py --real`
+
+### Custom Topic Mode
+- **Use case**: Custom controller setup
+- **Command**: `ros2 run ada_moveit ada_keyboard_teleop.py --topic /your/custom/topic`
+
+## Usage
 
 ## Camera Calibration
 

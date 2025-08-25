@@ -9,6 +9,10 @@ This module contains a ROS2 node to allow the user to teleoperate the ADA arm
 using the keyboard. Specifically, this node allows users to send linear cartesian
 velocities in the base frame, angular cartesian velocities in the end-effector
 frame, or joint velocities to the robot via MoveIt Servo.
+
+Usage:
+    ros2 run ada_moveit ada_keyboard_teleop.py --mock    # For mock simulation
+    ros2 run ada_moveit ada_keyboard_teleop.py --real    # For real robot
 """
 
 # Standard imports
@@ -16,6 +20,7 @@ import termios
 import tty
 import select
 import sys
+import argparse
 
 # Third-party imports
 from control_msgs.msg import JointJog
@@ -26,6 +31,7 @@ from tf2_geometry_msgs import Vector3Stamped  # pylint: disable=unused-import
 import tf2_py as tf2
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
+from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 
 INSTRUCTION_MSG = """
 Control the ADA arm!
@@ -97,24 +103,62 @@ joint_control_bindings = {
 reverse_joint_direction_key = "r"  # pylint: disable=invalid-name
 
 
+def parse_arguments():
+    """Parse command line arguments to determine robot mode."""
+    parser = argparse.ArgumentParser(description='ADA Keyboard Teleop')
+    parser.add_argument('--mock', action='store_true', 
+                       help='Use mock simulation mode (servo control)')
+    parser.add_argument('--real', action='store_true', 
+                       help='Use real robot mode (cartesian controller)')
+    parser.add_argument('--topic', type=str,
+                       help='Custom cartesian command topic (overrides mode selection)')
+    
+    args = parser.parse_args()
+    
+    # Determine the cartesian command topic
+    if args.topic:
+        # Custom topic specified
+        cartesian_topic = args.topic
+        mode = "custom"
+    elif args.real:
+        # Real robot mode
+        cartesian_topic = "/jaco_arm_cartesian_controller/twist_cmd"
+        mode = "real"
+    elif args.mock:
+        # Mock simulation mode
+        cartesian_topic = "/servo_node/delta_twist_cmds"
+        mode = "mock"
+    else:
+        # Default to mock mode
+        cartesian_topic = "/servo_node/delta_twist_cmds"
+        mode = "mock"
+    
+    return cartesian_topic, mode
+
+
 def main(args=None):
-    """
-    Launch the ROS node and spin.
-    """
-    # pylint: disable=too-many-locals, too-many-statements, too-many-branches
-    # pylint: disable=too-many-nested-blocks
-    # This function does the entire work of teleoperation, so it is expected
-    # to be somewhat complex.
-
-    settings = termios.tcgetattr(sys.stdin)
-
+    """Main function for the keyboard teleop node."""
+    # Parse command line arguments
+    cartesian_topic, mode = parse_arguments()
+    
     # Initialize the ROS context
     rclpy.init(args=args)
     node = rclpy.create_node("ada_keyboard_teleop")
+    
+    # Print mode information
+    print(f"🎮 ADA Keyboard Teleop - Mode: {mode.upper()}")
+    print(f"📡 Cartesian topic: {cartesian_topic}")
+    print("⌨️  Use WASD keys for linear motion, QE for angular motion, 1-6 for joint control")
+    print("🔄 Press 'r' to reverse joint direction, 'c' to clear commands, 'q' to quit")
+    print()
+    
     twist_pub = node.create_publisher(
-        TwistStamped, "/jaco_arm_cartesian_controller/twist_cmd", 1
+        # TwistStamped, "/servo_node/delta_twist_cmds", 1
+        TwistStamped, cartesian_topic, 1
     )
     joint_pub = node.create_publisher(JointJog, "/servo_node/delta_joint_cmds", 1)
+
+    settings = termios.tcgetattr(sys.stdin)
 
     # Initialize the tf2 buffer and listener
     tf_buffer = Buffer()
