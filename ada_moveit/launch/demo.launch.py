@@ -86,6 +86,14 @@ def generate_launch_description():
     )
     log_level = LaunchConfiguration("log_level")
 
+    # Option to relax collisions (publish ACM diff)
+    relax_da = DeclareLaunchArgument(
+        "relax_collisions",
+        default_value="false",
+        description="If true, publishes an AllowedCollisionMatrix to relax arm vs camera/fork/sensor collisions",
+    )
+    relax_collisions = LaunchConfiguration("relax_collisions")
+
     # Copy from generate_demo_launch
     ld = LaunchDescription()
     ld.add_action(calib_da)
@@ -94,6 +102,7 @@ def generate_launch_description():
     ld.add_action(ctrl_da)
     ld.add_action(servo_da)
     ld.add_action(log_level_da)
+    ld.add_action(relax_da)
 
     # Launch argument for whether to use moveit servo or not
     ld.add_action(DeclareBooleanLaunchArg("use_servo", default_value=False))
@@ -184,6 +193,17 @@ def generate_launch_description():
                 "use_octomap": use_octomap,
                 "log_level": log_level,
             }.items(),
+        )
+    )
+
+    # Publish relaxed ACM if requested (one-shot helper node)
+    ld.add_action(
+        Node(
+            package="ada_moveit",
+            executable="relax_collisions.py",
+            name="relax_collisions",
+            output="screen",
+            condition=IfCondition(relax_collisions),
         )
     )
 

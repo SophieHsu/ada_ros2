@@ -40,10 +40,7 @@ class VlaToJTC(Node):
         self.hand_ac = ActionClient(self, FollowJointTrajectory,
                                     f"/{args.hand_controller}/follow_joint_trajectory") if args.hand_controller else None
 
-        # Buffers
-        self.ik_points = []        # list[dict name->pos]
-        self.grip_vals = []        # list[float in 0..1]
-        self.dt_points = []        # list[float] per accepted IK point
+        # State tracking
         self.last_sent_positions = None  # list[float] matching arm_joints order
         self.q_prev_list = None    # previous IK solution (ordered list)
 
@@ -109,20 +106,35 @@ class VlaToJTC(Node):
         ps.pose.position.x, ps.pose.position.y, ps.pose.position.z = pos.tolist()
         ps.pose.orientation.x, ps.pose.orientation.y, ps.pose.orientation.z, ps.pose.orientation.w = quat.tolist()
         req.ik_request.pose_stamped = ps
+        
+        # Print the IK target position and orientation
+        print(f"IK Target - Position: [{pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f}]")
+        print(f"IK Target - Orientation (quat): [{quat[0]:.4f}, {quat[1]:.4f}, {quat[2]:.4f}, {quat[3]:.4f}]")
 
         # Seed (ordered vector)
         seed_vec = self._ordered_seed_from_map(seed_positions)
         req.ik_request.robot_state.joint_state.name = list(self.args.arm_joints)
         req.ik_request.robot_state.joint_state.position = seed_vec
+        
+        # Print the seed joint positions
+        print(f"IK Seed - Joint positions: {[f'{j:.4f}' for j in seed_vec]}")
 
+        t0 = time.time()
+        print("requesting IK: ", req)
         fut = self.ik_cli.call_async(req)
+        print("waiting for IK response", fut)
         rclpy.spin_until_future_complete(self, fut)
+        dt = time.time() - t0
+        print("IK request sent: took ", dt, "seconds")
         res = fut.result()
         if not res or res.error_code.val != res.error_code.SUCCESS:
+            print(f"IK FAILED - Error code: {res.error_code.val if res else 'No response'}")
             return None
         names = res.solution.joint_state.name
         posns = res.solution.joint_state.position
-        return {n:p for n,p in zip(names, posns)}
+        solution_dict = {n:p for n,p in zip(names, posns)}
+        print(f"IK SUCCESS - Solution: {[f'{solution_dict[j]:.4f}' for j in self.args.arm_joints]}")
+        return solution_dict
 
     def grip_map(self, g):
         g = float(np.clip(g, 0.0, 1.0))
@@ -135,6 +147,72 @@ class VlaToJTC(Node):
         pt.positions = positions
         pt.time_from_start = Duration(seconds=tfs).to_msg()
         return pt
+
+    def send_single_point_and_wait(self, q_sol, g_val, dt_val):
+        """
+        Send a single joint position with timing.
+        Adds a short continuity point at t = continuity_hold_s, then
+        schedules the target point at t = continuity_hold_s + dt_val.
+        """
+        # Arm trajectory
+        jt = JointTrajectory()
+        jt.joint_names = self.args.arm_joints
+
+        # Continuity point: last sent (or current joints)
+        if self.last_sent_positions is None:
+            cur = self._ordered_current_joints()
+            self.last_sent_positions = cur
+
+        tfs0 = self.args.continuity_hold_s * self.args.time_scale
+        jt.points.append(self.make_hold_point(self.last_sent_positions, tfs0))
+
+        # Target point
+        t_target = tfs0 + dt_val * self.args.time_scale
+        pt = JointTrajectoryPoint()
+        pt.positions = [q_sol[n] for n in self.args.arm_joints]
+        pt.time_from_start = Duration(seconds=t_target).to_msg()
+        jt.points.append(pt)
+
+        # Keep last for next point continuity
+        self.last_sent_positions = pt.positions
+
+        # Send arm trajectory (block until done)
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory = jt
+        goal.goal_time_tolerance = Duration(seconds=1.0).to_msg()
+        self.get_logger().info(f"[ARM] Sending single point: dur ~{dt_val:.2f}s (+{tfs0:.2f}s hold)")
+
+        arm_send = self.arm_ac.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, arm_send)
+        arm_goal_handle = arm_send.result()
+        if not arm_goal_handle.accepted:
+            self.get_logger().error("Arm trajectory goal was rejected")
+            return
+        arm_result_future = arm_goal_handle.get_result_async()
+        rclpy.spin_until_future_complete(self, arm_result_future)
+        _res = arm_result_future.result()
+
+        # Gripper trajectory (optional, matching timing)
+        if self.hand_ac:
+            gtraj = JointTrajectory()
+            gtraj.joint_names = self.args.finger_joints
+
+            # continuity hold
+            gtraj.points.append(self.make_hold_point(self.grip_map(g_val), tfs0))
+
+            # target point
+            gp = JointTrajectoryPoint()
+            gp.positions = self.grip_map(g_val)
+            gp.time_from_start = Duration(seconds=t_target).to_msg()
+            gtraj.points.append(gp)
+
+            self.get_logger().info(f"[GRIP] Sending single point")
+            gsend = self.hand_ac.send_goal_async(FollowJointTrajectory.Goal(trajectory=gtraj))
+            rclpy.spin_until_future_complete(self, gsend)
+            ggoal_h = gsend.result()
+            if ggoal_h.accepted:
+                gresult_future = ggoal_h.get_result_async()
+                rclpy.spin_until_future_complete(self, gresult_future)
 
     def send_chunk_and_wait(self, q_list, g_list, dt_list):
         """
@@ -234,10 +312,7 @@ class VlaToJTC(Node):
         pos, quat = self.current_eef_pose()
         seed = dict(self.joint_map)
 
-        # Reset buffers
-        self.ik_points.clear()
-        self.grip_vals.clear()
-        self.dt_points.clear()
+        # Reset state
         self.last_sent_positions = None
         self.q_prev_list = None
 
@@ -248,7 +323,6 @@ class VlaToJTC(Node):
         self.q_prev_list = self._ordered_current_joints()
         self.last_sent_positions = list(self.q_prev_list)
 
-        idx_sent = 0
         for i, a in enumerate(A):
             dpos = a[:3]; drot = a[3:6]; g = float(a[6])
             pos = pos + dpos
@@ -272,26 +346,8 @@ class VlaToJTC(Node):
             seed.update(q_sol)
             self.q_prev_list = q_curr_list
 
-            # buffer
-            self.ik_points.append(q_sol)
-            self.grip_vals.append(g)
-            self.dt_points.append(dt_i)
-
-            # Start publishing once we have at least chunk_size buffered
-            if len(self.ik_points) - idx_sent >= self.args.chunk_size:
-                q_chunk = self.ik_points[idx_sent: idx_sent + self.args.chunk_size]
-                g_chunk = self.grip_vals[idx_sent: idx_sent + self.args.chunk_size]
-                dt_chunk = self.dt_points[idx_sent: idx_sent + self.args.chunk_size]
-                self.send_chunk_and_wait(q_chunk, g_chunk, dt_chunk)
-                idx_sent += self.args.chunk_size
-                # If IK is slower than execution, the controller holds last point.
-
-        # Flush remaining < chunk_size
-        if len(self.ik_points) > idx_sent:
-            q_chunk = self.ik_points[idx_sent:]
-            g_chunk = self.grip_vals[idx_sent:]
-            dt_chunk = self.dt_points[idx_sent:]
-            self.send_chunk_and_wait(q_chunk, g_chunk, dt_chunk)
+            # Send immediately - process one position at a time
+            self.send_single_point_and_wait(q_sol, g, dt_i)
 
         self.get_logger().info("Episode done.")
 
@@ -308,10 +364,9 @@ def main():
         "j2n6s200_joint_4","j2n6s200_joint_5","j2n6s200_joint_6"
     ])
 
-    # Timing & chunking
-    ap.add_argument("--chunk_size", type=int, default=10, help="Min buffered IK points before first publish")
+    # Timing
     ap.add_argument("--continuity_hold_s", type=float, default=0.05,
-                    help="Initial hold per chunk at last position to ensure continuity")
+                    help="Initial hold per point at last position to ensure continuity")
 
     # Speed → duration mapping (cartesian & joint-based)
     ap.add_argument("--v_lin_max", type=float, default=0.05, help="m/s cap used to compute dt from ‖dpos‖")
