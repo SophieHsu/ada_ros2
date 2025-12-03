@@ -127,6 +127,9 @@ class StreamVLAtoJTC(Node):
         self.latest_rgb_stamp = None
         self._latest_rgb_ns = None  # int ns of latest_rgb_stamp
         self.last_fetch_ns = None   # int ns of the frame used in the last server query
+        self.latest_wrist_rgb = None
+        self.latest_wrist_rgb_stamp = None
+        self._latest_wrist_rgb_ns = None  # int ns of latest_wrist_rgb_stamp
 
         # IK/JTC buffers
         self.ik_points: List[dict] = []
@@ -149,6 +152,8 @@ class StreamVLAtoJTC(Node):
         # Subs
         self.create_subscription(JointState, "/joint_states", self._on_js, 50)
         self.create_subscription(ImageMsg, self.args.image_topic, self._on_image, 10)
+        if self.args.wrist_image_topic:
+            self.create_subscription(ImageMsg, self.args.wrist_image_topic, self._on_wrist_image, 10)
 
         # IK service + action clients
         self.ik_cli = self.create_client(GetPositionIK, "/compute_ik")
@@ -203,6 +208,24 @@ class StreamVLAtoJTC(Node):
                 pass
         except Exception as e:
             self.get_logger().warn(f"Image conversion failed: {e}")
+
+    def _on_wrist_image(self, msg: ImageMsg):
+        try:
+            rgb = imgmsg_to_cv2(msg, desired_encoding="rgb8")
+            self.latest_wrist_rgb = rgb.copy()
+            self.latest_wrist_rgb_stamp = msg.header.stamp
+            try:
+                self._latest_wrist_rgb_ns = ns_from_stamp(self.latest_wrist_rgb_stamp)
+                if self.actions_queue:
+                    newq = deque()
+                    for it in self.actions_queue:
+                        if isinstance(it, tuple) and len(it) == 2 and it[1] == self._latest_wrist_rgb_ns:
+                            newq.append(it)
+                    self.actions_queue = newq
+            except Exception:
+                pass
+        except Exception as e:
+            self.get_logger().warn(f"Image conversion failed (wrist): {e}")
 
     # ----- readiness -----
     def _wait_ready(self):
@@ -273,8 +296,7 @@ class StreamVLAtoJTC(Node):
             t = tf.transform.translation; q = tf.transform.rotation
             roll, pitch, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
             g = self._grip_fraction()
-            return [t.x, t.y, t.z, q.x, q.y, q.z, q.w, g]
-            # return [t.x, t.y, t.z, roll, pitch, yaw, 0.0, g]
+            return [t.x, t.y, t.z, roll, pitch, yaw, 0.0, g]
         except Exception:
             return [0.0]*8
 
@@ -305,6 +327,8 @@ class StreamVLAtoJTC(Node):
 
         req.ik_request.robot_state.joint_state.name = list(self.args.arm_joints)
         req.ik_request.robot_state.joint_state.position = seed_vec
+        req.ik_request.robot_state.joint_state.name = list(self.args.arm_joints)
+        req.ik_request.robot_state.joint_state.position = seed_vec
         print("current joint positions: ", self._ordered_current_joints())
         print("requesting IK target pos: ", pos)
         print("requesting IK target quat: ", quat)
@@ -327,6 +351,7 @@ class StreamVLAtoJTC(Node):
     # ----- trajectory send (async) -----
     def _send_chunk_async(self, q_list, g_list, dt_list):
         if len(q_list) == 0:
+            self.get_logger().info("No points to send.")
             return
 
         jt = JointTrajectory()
@@ -461,10 +486,19 @@ class StreamVLAtoJTC(Node):
         img.save(buf, format="JPEG", quality=90)
         return base64.b64encode(buf.getvalue()).decode("ascii")
 
+    def _encode_latest_wrist_image_b64(self) -> Optional[str]:
+        if self.latest_wrist_rgb is None:
+            return None
+        img = Image.fromarray(self.latest_wrist_rgb)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=90)
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+
     def _query_server(self) -> int:
         """Return number of actions appended; 0 if none/failed."""
         img_b64 = self._encode_latest_image_b64()
-        if img_b64 is None:
+        wrist_img_b64 = self._encode_latest_wrist_image_b64()
+        if img_b64 is None or wrist_img_b64 is None:
             return 0
 
         frame_ns = None
@@ -475,6 +509,7 @@ class StreamVLAtoJTC(Node):
             frame_ns = None
         payload = {
             "image_b64": img_b64,
+            "wrist_image_b64": wrist_img_b64,
             "instruction": self.args.instruction,
             "state": self._proprio_state() if self.args.send_proprio else [],
             "return_chunk": bool(self.args.return_chunk)
@@ -498,7 +533,6 @@ class StreamVLAtoJTC(Node):
                     # enforce max queue length
                     while len(self.actions_queue) > self.args.max_queue:
                         self.actions_queue.popleft()
-
             self.last_fetch_ns = frame_ns
             self.get_logger().info(f"Received {len(acts)} actions from server (chunk={bool(self.args.return_chunk)})")
             print("actions received from server: ", acts[0])
@@ -531,9 +565,19 @@ class StreamVLAtoJTC(Node):
             if ns_from_stamp(self.latest_rgb_stamp) <= ns_from_stamp(self.last_exec_end_stamp):
                 return
 
+        if self.args.require_fresh_image_after_exec and self.last_exec_end_stamp is not None:
+            if self.latest_wrist_rgb_stamp is None:
+                return
+            if ns_from_stamp(self.latest_wrist_rgb_stamp) <= ns_from_stamp(self.last_exec_end_stamp):
+                return
+
         # Fresh-since-fetch guard (avoid stacking for the same frame)
         if self.last_fetch_ns is not None and self.latest_rgb_stamp is not None:
             if ns_from_stamp(self.latest_rgb_stamp) <= int(self.last_fetch_ns):
+                return
+        
+        if self.last_fetch_ns is not None and self.latest_wrist_rgb_stamp is not None:
+            if ns_from_stamp(self.latest_wrist_rgb_stamp) <= int(self.last_fetch_ns):
                 return
 
         # Re-seed periodically
@@ -585,12 +629,13 @@ class StreamVLAtoJTC(Node):
                 self.q_prev_list = q_curr_list
                 self.get_logger().info(f"IK successful (async) - code: {res.error_code.val if res else 'No response'}")
                 self.get_logger().info(f"IK solution: {q_sol}, dpos: {dpos}, drot: {drot}, g: {g}")
+
                 self.get_logger().info(f"Executing: {self.executing}")
                 self.get_logger().info(f"IK points: {len(self.ik_points)}")
 
         # Send single point if ready and not currently executing
         if len(self.ik_points) >= self.args.chunk_size and not self.executing:
-            self.get_logger().info(f"Sending chunk: {len(self.ik_points)} points, not executing")
+            self.get_logger().info("Sending chunk: {len(self.ik_points)} points, not executing")
             k = self.args.chunk_size
             q_chunk = self.ik_points[:k]
             g_chunk = self.grip_vals[:k]
@@ -603,6 +648,7 @@ class StreamVLAtoJTC(Node):
 
         # Start a new IK if none is pending and we have actions
         if self.pending_ik_future is None and self.actions_queue:
+            self.get_logger().info("Starting a new IK")
             # Drop stale actions: those computed on a frame older than our latest
             while self.actions_queue:
                 item = self.actions_queue.popleft()
@@ -650,12 +696,11 @@ class StreamVLAtoJTC(Node):
                 self.pending_ik_meta = {'dpos': dpos, 'drot': drot, 'g': g}
                 return  # let the executor process IK
 
-
     # ----- spin -----
     def spin_forever(self):
         # wait briefly for first image + joints
         t0 = time.time()
-        while (self.latest_rgb is None or not self.joint_map) and rclpy.ok():
+        while ((self.latest_rgb is None) or (self.latest_wrist_rgb is None) or (not self.joint_map)) and rclpy.ok():
             if (time.time() - t0) > 3.0:
                 break
             rclpy.spin_once(self, timeout_sec=0.05)
@@ -680,7 +725,7 @@ def main():
     ap.add_argument("--server_url", required=True, help="e.g., http://SERVER:8010/infer")
     ap.add_argument("--instruction", required=True)
     ap.add_argument("--server_timeout_s", type=float, default=5.0)
-    ap.add_argument("--vision_rate_hz", type=float, default=6.0, help="How often to query server (/infer)")
+    ap.add_argument("--vision_rate_hz", type=float, default=5.0, help="How often to query server (/infer)")
     ap.add_argument("--min_server_queue", type=int, default=1, help="Fetch new chunk if queue < this")
     ap.add_argument("--max_queue", type=int, default=16, help="Max actions to buffer; drop oldest when exceeded")
     ap.add_argument("--reseed_every", type=int, default=5, help="Reseed pose cursor from TF every N chunks")
@@ -703,6 +748,7 @@ def main():
 
     # ROS I/O
     ap.add_argument("--image_topic", default="/camera/camera/color/image_raw")
+    ap.add_argument("--wrist_image_topic", default="/camera/wrist/color/image_raw")
     ap.add_argument("--camera_frame", default="camera_color_optical_frame")
     ap.add_argument("--pub_debug_image", action="store_true",
                     help="Republish the exact frame sent to server on ~sent_image")
@@ -713,7 +759,7 @@ def main():
     ap.add_argument("--base_frame", default="j2n6s200_link_base")
     ap.add_argument("--eef_frame",  default="j2n6s200_end_effector")
     ap.add_argument("--move_group", default="jaco_arm")
-    ap.add_argument("--arm_controller", default="jaco_arm_servo_controller")
+    ap.add_argument("--arm_controller", default="jaco_arm_position_controller")
     ap.add_argument("--hand_controller", default="hand_controller")
     ap.add_argument("--arm_joints", nargs="+", default=[
         "j2n6s200_joint_1","j2n6s200_joint_2","j2n6s200_joint_3",
@@ -724,7 +770,7 @@ def main():
     ap.add_argument("--finger_closed", nargs="+", type=float, default=[1.0, 1.0])
 
     # IK timing & chunking
-    ap.add_argument("--chunk_size", type=int, default=4, help="Minimum IK points before sending a chunk")
+    ap.add_argument("--chunk_size", type=int, default=1, help="Minimum IK points before sending a chunk")
     ap.add_argument("--max_ik_per_tick", type=int, default=5, help="(unused w/ async-one-at-a-time IK)")
     ap.add_argument("--continuity_hold_s", type=float, default=0.01)
     ap.add_argument("--time_scale", type=float, default=1.0)

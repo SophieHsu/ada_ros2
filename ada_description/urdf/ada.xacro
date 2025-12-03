@@ -66,6 +66,13 @@
   />
 
   <!-- Hard-coded Extrinsics -->
+  <link name="wrist_camera_link"/>
+  <joint name="wrist_camera_joint" type="fixed">
+    <parent link="cameraMount"/>
+    <child link="wrist_camera_link"/>
+    <origin xyz="0.03 0.00 0.08" rpy="0 1.5708 0"/>
+  </joint>
+
   <link name="camera_link"/>
   <joint
     name="extrinsics"
