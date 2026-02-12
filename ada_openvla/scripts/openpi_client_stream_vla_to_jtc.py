@@ -481,22 +481,34 @@ class StreamVLAtoJTC(Node):
         try:
             gh = fut.result()
         except Exception as e:
-            self.get_logger().warn(f"Gripper goal send failed: {e}")
+            self.get_logger().warn(f"[GRIPPER] goal send FAILED: {e}")
             self._gripper_done = True
             self._check_chunk_finished()
             return
 
         if not gh or not gh.accepted:
-            self.get_logger().warn("Gripper trajectory rejected")
+            self.get_logger().warn("[GRIPPER] goal REJECTED by controller")
             self._gripper_done = True
             self._check_chunk_finished()
             return
 
+        self.get_logger().info("[GRIPPER] goal ACCEPTED, waiting for result…")
         res_fut = gh.get_result_async()
         res_fut.add_done_callback(self._on_gripper_result)
-        self.get_logger().info("Gripper goal response received")
 
     def _on_gripper_result(self, fut):
+        try:
+            result = fut.result()
+            status = result.status
+            error_code = result.result.error_code if result.result else None
+            error_string = result.result.error_string if result.result else ""
+            # status: 2=active, 4=succeeded, 5=canceled, 6=aborted
+            status_names = {2: "ACTIVE", 4: "SUCCEEDED", 5: "CANCELED", 6: "ABORTED"}
+            self.get_logger().info(
+                f"[GRIPPER] result: status={status_names.get(status, status)}, "
+                f"error_code={error_code}, error_string='{error_string}'")
+        except Exception as e:
+            self.get_logger().warn(f"[GRIPPER] result callback error: {e}")
         self._gripper_done = True
         self._check_chunk_finished()
 
