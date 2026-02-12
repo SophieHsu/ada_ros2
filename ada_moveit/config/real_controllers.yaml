@@ -110,17 +110,15 @@ hand_controller:
       - j2n6s200_joint_finger_1
       - j2n6s200_joint_finger_2
     command_interfaces:
-      - velocity
+      - position
     state_interfaces:
       - position
       - velocity
     allow_partial_joints_goal: false
     open_loop_control: false
     constraints:
-      stopped_velocity_tolerance: 0.01
-    gains: # Required because we're controlling a velocity interface
-      j2n6s200_joint_finger_1: {p: 1.0,  d: 0.0, i: 0.0, i_clamp: 1.0}
-      j2n6s200_joint_finger_2: {p: 1.0,  d: 0.0, i: 0.0, i_clamp: 1.0}
+      goal_time: 2.0
+      stopped_velocity_tolerance: 0.02
 
 jaco_arm_position_controller:
   ros__parameters:
