@@ -499,6 +499,7 @@ class StreamVLAtoJTC(Node):
         """Only mark chunk as finished when BOTH arm and gripper are done."""
         if self._arm_done and self._gripper_done:
             self._on_chunk_finished()
+            self.get_logger().loginfo("Both arm and gripper are done. Chunk finished")
 
     def _on_chunk_finished(self):
         # Reseed pose cursor after executing a chunk
