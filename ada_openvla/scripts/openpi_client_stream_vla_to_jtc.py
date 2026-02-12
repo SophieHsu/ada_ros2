@@ -38,6 +38,8 @@ from tf_transformations import quaternion_multiply as qmul, euler_from_quaternio
 # from cv_bridge import CvBridge  # Commented out due to NumPy 2.x compatibility issues
 from PIL import Image
 
+
+
 # -------- cv_bridge replacement --------
 def imgmsg_to_cv2(msg, desired_encoding="rgb8"):
     try:
@@ -94,6 +96,8 @@ def cv2_to_imgmsg(cv_img, encoding="rgb8"):
     msg.data = cv_img.tobytes()
     return msg
 
+from scipy.spatial.transform import Rotation as R
+
 # -------- helpers --------
 def axis_angle_to_quat(ax: np.ndarray) -> np.ndarray:
     angle = float(np.linalg.norm(ax))
@@ -101,7 +105,12 @@ def axis_angle_to_quat(ax: np.ndarray) -> np.ndarray:
         return np.array([0., 0., 0., 1.], dtype=np.float64)
     axis = (ax / angle).astype(np.float64)
     s = math.sin(0.5 * angle)
-    return np.array([axis[0]*s, axis[1]*s, axis[2]*s, math.cos(0.5*angle)], np.float64)
+    return np.array([math.cos(0.5*angle), axis[0]*s, axis[1]*s, axis[2]*s], np.float64)
+
+    # print("axis_angle: ", ax)
+
+    # return R.from_rotvec(ax).as_quat(scalar_first=True) # w x y z
+
 
 def quat_norm(q):
     q = np.asarray(q)
@@ -110,6 +119,15 @@ def quat_norm(q):
 
 def ns_from_stamp(stamp: Time) -> int:
     return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+
+def quat_to_axis_angle(q_rel):
+    q = q_rel / max(1e-12, np.linalg.norm(q_rel))
+    w = np.clip(q[3], -1.0, 1.0)
+    angle = 2.0*math.acos(w)
+    s = math.sqrt(max(1e-12, 1.0 - w*w))
+    if s < 1e-8:
+        return np.array([1.,0.,0.], np.float64), 0.0
+    return np.array([q[0]/s, q[1]/s, q[2]/s], np.float64), angle
 
 # -------- main node --------
 class StreamVLAtoJTC(Node):
@@ -296,7 +314,10 @@ class StreamVLAtoJTC(Node):
             t = tf.transform.translation; q = tf.transform.rotation
             roll, pitch, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
             g = self._grip_fraction()
-            return [t.x, t.y, t.z, roll, pitch, yaw, 0.0, g]
+            # return [t.x, t.y, t.z, roll, pitch, yaw, 0.0, g]
+            # return [t.x, t.y, t.z, q.x, q.y, q.z, q.w, g]
+            return [t.x, t.y, t.z, -q.x, -q.y, -q.z, -q.w, g]
+
         except Exception:
             return [0.0]*8
 
@@ -430,6 +451,7 @@ class StreamVLAtoJTC(Node):
                 gtraj.points.append(gp)
 
             ggoal = FollowJointTrajectory.Goal(trajectory=gtraj)
+            ggoal.goal_time_tolerance = Duration(seconds=1.0).to_msg()
             gsend = self.hand_ac.send_goal_async(ggoal)
             gsend.add_done_callback(self._on_gripper_goal_response)
         except Exception as e:
@@ -686,6 +708,10 @@ class StreamVLAtoJTC(Node):
             # integrate pose cursor
             self.pose_cursor_pos = self.pose_cursor_pos + dpos
             self.pose_cursor_quat = quat_norm(np.array(qmul(self.pose_cursor_quat, axis_angle_to_quat(drot))))
+
+            print("pose_cursor_quat: ", self.pose_cursor_quat)
+            print("pose_cursor_pos: ", self.pose_cursor_pos)
+            print("current g", g)
 
             # Start async IK
             seed = dict(self.joint_map)
