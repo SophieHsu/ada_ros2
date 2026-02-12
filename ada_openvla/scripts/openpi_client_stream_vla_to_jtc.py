@@ -165,7 +165,8 @@ class StreamVLAtoJTC(Node):
         self.last_exec_end_stamp = None  # builtin_interfaces/Time
         self.pending_ik_future = None
         self.pending_ik_meta = None
-        self._pending_gripper_data = None  # {'g_list':..., 'dt_list':..., 'tfs0':...}
+        self._arm_done = False
+        self._gripper_done = False
 
         # Subs
         self.create_subscription(JointState, "/joint_states", self._on_js, 50)
@@ -369,12 +370,18 @@ class StreamVLAtoJTC(Node):
         fc = np.array(self.args.finger_closed, dtype=np.float64)
         return (fo + g*(fc-fo)).tolist()
 
-    # ----- trajectory send (async) -----
+    # ----- trajectory send (async, arm + gripper in PARALLEL) -----
     def _send_chunk_async(self, q_list, g_list, dt_list):
         if len(q_list) == 0:
             self.get_logger().info("No points to send.")
             return
 
+        # Mark executing; track arm and gripper completion independently
+        self.executing = True
+        self._arm_done = False
+        self._gripper_done = not bool(self.hand_ac)  # already "done" if no hand controller
+
+        # --- ARM trajectory ---
         jt = JointTrajectory()
         jt.joint_names = self.args.arm_joints
 
@@ -398,28 +405,55 @@ class StreamVLAtoJTC(Node):
         goal.trajectory = jt
         goal.goal_time_tolerance = Duration(seconds=1.0).to_msg()
 
-        # Mark executing and stash gripper data (to be sent after arm result, matching old behavior)
-        self.executing = True
-        self._pending_gripper_data = {'g_list': g_list, 'dt_list': dt_list, 'tfs0': tfs0}
-
         self.get_logger().info(f"[ARM] chunk: {len(q_list)} pts, dur≈{t_acc - tfs0:.2f}s (+{tfs0:.2f}s hold)")
         arm_send = self.arm_ac.send_goal_async(goal)
         arm_send.add_done_callback(self._on_arm_goal_response)
 
-    # ----- action callbacks -----
+        # --- GRIPPER trajectory (sent in PARALLEL with arm) ---
+        if self.hand_ac and len(g_list) > 0:
+            try:
+                gtraj = JointTrajectory()
+                gtraj.joint_names = self.args.finger_joints
+
+                grip_hold = max(tfs0, self.args.grip_min_duration)
+                gtraj.points.append(self._make_hold_point(
+                    self._grip_map(g_list[0]), grip_hold))
+
+                gt_acc = grip_hold
+                for g, dtk in zip(g_list, dt_list):
+                    gt_acc += max(dtk * self.args.time_scale, self.args.grip_min_duration)
+                    gp = JointTrajectoryPoint()
+                    gp.positions = self._grip_map(g)
+                    gp.time_from_start = Duration(seconds=gt_acc).to_msg()
+                    gtraj.points.append(gp)
+
+                ggoal = FollowJointTrajectory.Goal(trajectory=gtraj)
+                ggoal.goal_time_tolerance = Duration(seconds=2.0).to_msg()
+
+                self.get_logger().info(
+                    f"[GRIPPER] chunk: {len(g_list)} pts, dur≈{gt_acc:.2f}s, "
+                    f"target positions: {self._grip_map(g_list[-1])}")
+                gsend = self.hand_ac.send_goal_async(ggoal)
+                gsend.add_done_callback(self._on_gripper_goal_response)
+            except Exception as e:
+                self.get_logger().warn(f"Gripper send failed: {e}")
+                self._gripper_done = True
+                self._check_chunk_finished()
+
+    # ----- action callbacks (arm + gripper independent) -----
     def _on_arm_goal_response(self, fut):
         try:
             gh = fut.result()
         except Exception as e:
             self.get_logger().error(f"Arm goal send failed: {e}")
-            self.executing = False
-            self._pending_gripper_data = None
+            self._arm_done = True
+            self._check_chunk_finished()
             return
 
         if not gh or not gh.accepted:
             self.get_logger().error("Arm trajectory rejected")
-            self.executing = False
-            self._pending_gripper_data = None
+            self._arm_done = True
+            self._check_chunk_finished()
             return
 
         res_fut = gh.get_result_async()
@@ -428,54 +462,35 @@ class StreamVLAtoJTC(Node):
     def _on_arm_result(self, fut):
         # mark when execution ended (for fresh-frame gating)
         self.last_exec_end_stamp = self.get_clock().now().to_msg()
-
-        # After arm completes, optionally send gripper trajectory (sequential, matching prior code)
-        if not self.hand_ac or not self._pending_gripper_data or len(self._pending_gripper_data.get('g_list', [])) == 0:
-            self._on_chunk_finished()
-            return
-
-        try:
-            g_list = self._pending_gripper_data['g_list']
-            dt_list = self._pending_gripper_data['dt_list']
-            tfs0   = self._pending_gripper_data['tfs0']
-
-            gtraj = JointTrajectory()
-            gtraj.joint_names = self.args.finger_joints
-            gtraj.points.append(self._make_hold_point(self._grip_map(g_list[0]), tfs0))
-            t_acc = tfs0
-            for g, dtk in zip(g_list, dt_list):
-                t_acc += dtk * self.args.time_scale
-                gp = JointTrajectoryPoint()
-                gp.positions = self._grip_map(g)
-                gp.time_from_start = Duration(seconds=t_acc).to_msg()
-                gtraj.points.append(gp)
-
-            ggoal = FollowJointTrajectory.Goal(trajectory=gtraj)
-            ggoal.goal_time_tolerance = Duration(seconds=1.0).to_msg()
-            gsend = self.hand_ac.send_goal_async(ggoal)
-            gsend.add_done_callback(self._on_gripper_goal_response)
-        except Exception as e:
-            self.get_logger().warn(f"Gripper send failed: {e}")
-            self._on_chunk_finished()
+        self._arm_done = True
+        self._check_chunk_finished()
 
     def _on_gripper_goal_response(self, fut):
         try:
             gh = fut.result()
         except Exception as e:
             self.get_logger().warn(f"Gripper goal send failed: {e}")
-            self._on_chunk_finished()
+            self._gripper_done = True
+            self._check_chunk_finished()
             return
 
         if not gh or not gh.accepted:
             self.get_logger().warn("Gripper trajectory rejected")
-            self._on_chunk_finished()
+            self._gripper_done = True
+            self._check_chunk_finished()
             return
 
         res_fut = gh.get_result_async()
         res_fut.add_done_callback(self._on_gripper_result)
 
     def _on_gripper_result(self, fut):
-        self._on_chunk_finished()
+        self._gripper_done = True
+        self._check_chunk_finished()
+
+    def _check_chunk_finished(self):
+        """Only mark chunk as finished when BOTH arm and gripper are done."""
+        if self._arm_done and self._gripper_done:
+            self._on_chunk_finished()
 
     def _on_chunk_finished(self):
         # Reseed pose cursor after executing a chunk
@@ -484,7 +499,6 @@ class StreamVLAtoJTC(Node):
         except Exception as e:
             self.get_logger().warn(f"Pose reseed after chunk failed: {e}")
         self.executing = False
-        self._pending_gripper_data = None
 
     # ----- timing from deltas -----
     def _cartesian_dt(self, dpos, drot):
@@ -794,6 +808,8 @@ def main():
     ap.add_argument("--finger_joints", nargs="+", default=["j2n6s200_joint_finger_1","j2n6s200_joint_finger_2"])
     ap.add_argument("--finger_open",   nargs="+", type=float, default=[0.0, 0.0])
     ap.add_argument("--finger_closed", nargs="+", type=float, default=[1.0, 1.0])
+    ap.add_argument("--grip_min_duration", type=float, default=0.5,
+                    help="Minimum duration (seconds) for each gripper trajectory point")
 
     # IK timing & chunking
     ap.add_argument("--chunk_size", type=int, default=1, help="Minimum IK points before sending a chunk")
