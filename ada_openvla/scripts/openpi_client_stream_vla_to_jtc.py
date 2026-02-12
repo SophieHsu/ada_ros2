@@ -252,9 +252,9 @@ class StreamVLAtoJTC(Node):
         self.ik_cli.wait_for_service()
         self.get_logger().info("Waiting for arm JTC action …")
         self.arm_ac.wait_for_server()
-        if self.hand_ac:
-            self.get_logger().info("Waiting for hand JTC action …")
-            self.hand_ac.wait_for_server()
+        # if self.hand_ac:
+        self.get_logger().info("Waiting for hand JTC action …")
+        self.hand_ac.wait_for_server()
 
     # ----- pose & seeds -----
     def _ordered_current_joints(self) -> List[float]:
@@ -415,24 +415,32 @@ class StreamVLAtoJTC(Node):
                 gtraj = JointTrajectory()
                 gtraj.joint_names = self.args.finger_joints
 
+                # Hold point uses CURRENT gripper position (not target)
+                current_grip = [float(self.joint_map.get(fn, 0.0))
+                                for fn in self.args.finger_joints]
+
                 grip_hold = max(tfs0, self.args.grip_min_duration)
-                gtraj.points.append(self._make_hold_point(
-                    self._grip_map(g_list[0]), grip_hold))
+                gtraj.points.append(self._make_hold_point(current_grip, grip_hold))
 
                 gt_acc = grip_hold
-                for g, dtk in zip(g_list, dt_list):
+                for gv, dtk in zip(g_list, dt_list):
                     gt_acc += max(dtk * self.args.time_scale, self.args.grip_min_duration)
                     gp = JointTrajectoryPoint()
-                    gp.positions = self._grip_map(g)
+                    gp.positions = self._grip_map(gv)
                     gp.time_from_start = Duration(seconds=gt_acc).to_msg()
                     gtraj.points.append(gp)
 
                 ggoal = FollowJointTrajectory.Goal(trajectory=gtraj)
                 ggoal.goal_time_tolerance = Duration(seconds=2.0).to_msg()
 
+                target_pos = self._grip_map(g_list[-1])
                 self.get_logger().info(
-                    f"[GRIPPER] chunk: {len(g_list)} pts, dur≈{gt_acc:.2f}s, "
-                    f"target positions: {self._grip_map(g_list[-1])}")
+                    f"[GRIPPER] g_list={g_list}, "
+                    f"finger_open={self.args.finger_open}, "
+                    f"finger_closed={self.args.finger_closed}, "
+                    f"current_grip={current_grip}, "
+                    f"target_positions={target_pos}, "
+                    f"dur≈{gt_acc:.2f}s")
                 gsend = self.hand_ac.send_goal_async(ggoal)
                 gsend.add_done_callback(self._on_gripper_goal_response)
             except Exception as e:
@@ -671,11 +679,12 @@ class StreamVLAtoJTC(Node):
 
         # Send single point if ready and not currently executing
         if len(self.ik_points) >= self.args.chunk_size and not self.executing:
-            self.get_logger().info("Sending chunk: {len(self.ik_points)} points, not executing")
             k = self.args.chunk_size
             q_chunk = self.ik_points[:k]
             g_chunk = self.grip_vals[:k]
             dt_chunk = self.dt_points[:k]
+            self.get_logger().info(
+                f"Sending chunk: {k} pts, g_chunk={g_chunk}, dt_chunk={dt_chunk}")
             # pop before sending
             self.ik_points = self.ik_points[k:]
             self.grip_vals = self.grip_vals[k:]
