@@ -255,6 +255,10 @@ class StreamVLAtoJTC(Node):
         # if self.hand_ac:
         self.get_logger().info("Waiting for hand JTC action …")
         self.hand_ac.wait_for_server()
+        self.get_logger().info(f"Hand JTC action server is ready: {self.hand_ac.server_is_ready()}")
+        self.get_logger().info(f"Hand JTC topic: {self.hand_ac.get_topic_name()}")
+        self.get_logger().info(f"hand action client: {self.hand_ac}")
+        self.get_logger().info(f"hand args hand_controller: {self.args.hand_controller}")
 
     # ----- pose & seeds -----
     def _ordered_current_joints(self) -> List[float]:
@@ -380,7 +384,7 @@ class StreamVLAtoJTC(Node):
         self.executing = True
         self._arm_done = False
         self._gripper_done = not bool(self.hand_ac)  # already "done" if no hand controller
-
+        
         # --- ARM trajectory ---
         jt = JointTrajectory()
         jt.joint_names = self.args.arm_joints
@@ -490,6 +494,7 @@ class StreamVLAtoJTC(Node):
 
         res_fut = gh.get_result_async()
         res_fut.add_done_callback(self._on_gripper_result)
+        self.get_logger().info("Gripper goal response received")
 
     def _on_gripper_result(self, fut):
         self._gripper_done = True
@@ -499,7 +504,7 @@ class StreamVLAtoJTC(Node):
         """Only mark chunk as finished when BOTH arm and gripper are done."""
         if self._arm_done and self._gripper_done:
             self._on_chunk_finished()
-            self.get_logger().loginfo("Both arm and gripper are done. Chunk finished")
+            self.get_logger().info("Both arm and gripper are done. Chunk finished")
 
     def _on_chunk_finished(self):
         # Reseed pose cursor after executing a chunk
